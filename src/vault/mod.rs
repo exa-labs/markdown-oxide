@@ -3347,4 +3347,49 @@ Some content here";
 
         assert_eq!(parsed, expected);
     }
+
+    /// End-to-end: go-to-definition on a period-containing wikilink resolves to
+    /// the dotted target file. This is the exact scenario from the canon note
+    /// (`[[CandS Exa 3 v9.1 Repro Rerun|9.1]]`).
+    #[test]
+    fn goto_definition_resolves_period_in_filename() {
+        use crate::config::Settings;
+        use crate::vault::Vault;
+        use tower_lsp::lsp_types::{ClientCapabilities, Position};
+
+        let dir = std::env::temp_dir().join(format!("moxide_period_gd_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let note = dir.join("2026-06-10.md");
+        std::fs::write(
+            &note,
+            "# Other\n\n- [[CandS Exa 3 v9.1 Repro Rerun|9.1]] reproduces results\n",
+        )
+        .unwrap();
+        let target = dir.join("CandS Exa 3 v9.1 Repro Rerun.md");
+        std::fs::write(&target, "# CandS Exa 3 v9.1 Repro Rerun\n").unwrap();
+
+        let settings = Settings::new(&dir, &ClientCapabilities::default()).unwrap();
+        let vault = Vault::construct_vault(&settings, &dir).unwrap();
+
+        // Cursor inside the link target on the bullet line (row 2).
+        let pos = Position {
+            line: 2,
+            character: 10,
+        };
+        let locations = crate::gotodef::goto_definition(&vault, pos, &note)
+            .expect("goto_definition returned None for a period-containing wikilink");
+
+        let resolved = locations
+            .iter()
+            .any(|l| l.uri.to_file_path().unwrap() == target);
+
+        let _ = std::fs::remove_dir_all(&dir);
+
+        assert!(
+            resolved,
+            "expected the period-containing wikilink to resolve to {target:?}, got {locations:#?}"
+        );
+    }
 }
