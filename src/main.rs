@@ -1,5 +1,7 @@
+use std::backtrace::Backtrace;
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -263,7 +265,7 @@ impl Backend {
         // reader and the `shutdown`/`$/cancelRequest` handlers can no longer be
         // scheduled and the server goes silent. `block_in_place` moves the work
         // off the runtime's core threads so I/O and control messages keep flowing.
-        tokio::task::block_in_place(|| callback(vault))
+        tokio::task::block_in_place(|| catch_panic("vault query", || callback(vault)))
     }
 
     async fn bind_vault_mut<T>(&self, callback: impl Fn(&mut Vault) -> Result<T>) -> Result<T> {
@@ -288,7 +290,7 @@ impl Backend {
         // See `bind_vault`: vault construction/update is synchronous, and
         // `reconstruct_vault` performs blocking disk I/O across the whole vault.
         // Offload it from the async worker thread so the runtime stays responsive.
-        tokio::task::block_in_place(|| callback(vault))
+        tokio::task::block_in_place(|| catch_panic("vault update", || callback(vault)))
     }
 
     async fn bind_settings<T>(&self, callback: impl FnOnce(&Settings) -> Result<T>) -> Result<T> {
@@ -626,10 +628,16 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        // markdown-oxide negotiates full-document sync, so the final change holds
+        // the complete new text. The list can legitimately be empty (the LSP spec
+        // allows it), so don't index into it unconditionally.
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
         self.update_vault(TextDocumentItem {
             uri: params.text_document.uri,
-            text: params.content_changes.remove(0).text,
+            text: change.text,
         })
         .await;
     }
@@ -978,8 +986,57 @@ async fn jump_to_specific(
 
 use clap::Parser;
 
+/// Runs synchronous, possibly-panicking vault work, converting a panic into a
+/// logged LSP error instead of letting it unwind into the request-dispatch loop.
+///
+/// A panic that escapes a handler kills the dispatch task: the process keeps
+/// running but stops reading stdin, so the editor sees the server go silent (no
+/// backtrace is logged because the process never exits). Catching it here turns
+/// a fatal silent hang into a single failed request. The panic itself is still
+/// fully reported (message + backtrace) by the global hook from `install_panic_hook`.
+fn catch_panic<T>(context: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => Err(Error {
+            code: ErrorCode::InternalError,
+            message: format!("markdown-oxide handler panicked ({context}); see server log").into(),
+            data: None,
+        }),
+    }
+}
+
+/// Installs a global panic hook so every panic is reported with its message,
+/// location, and a full backtrace to stderr (which editors capture in their LSP
+/// log) and to a panic log file. Without this, panics are effectively invisible:
+/// they are caught at the task boundary and the server just stops responding.
+fn install_panic_hook() {
+    let log_path = std::env::temp_dir().join("markdown-oxide-panic.log");
+    eprintln!(
+        "[markdown-oxide] crash reporting enabled (panics -> stderr and {})",
+        log_path.display()
+    );
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = Backtrace::force_capture();
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let report = format!(
+            "\n==== MARKDOWN-OXIDE PANIC (thread: {thread_name}) ====\n{info}\nbacktrace:\n{backtrace}\n=====================================================\n"
+        );
+        eprint!("{report}");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(report.as_bytes());
+        }
+    }));
+}
+
 #[tokio::main]
 async fn main() {
+    install_panic_hook();
     let cli = cli::Cli::parse();
 
     match cli.command {

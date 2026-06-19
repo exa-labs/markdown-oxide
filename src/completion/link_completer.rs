@@ -27,6 +27,19 @@ use super::{
     Completable, Completer, Context,
 };
 
+/// Formats a date with a user-supplied chrono format string without panicking.
+///
+/// `chrono`'s `Display` impl returns an error for an invalid format specifier,
+/// and `format(...).to_string()` turns that error into a panic. `write!` instead
+/// surfaces it as `Err`, so a misconfigured `dailynote` format yields `None`
+/// rather than crashing the completion handler.
+fn format_date(date: NaiveDate, format: &str) -> Option<String> {
+    use std::fmt::Write;
+    let mut out = String::new();
+    write!(out, "{}", date.format(format)).ok()?;
+    Some(out)
+}
+
 /// Range on a single line; assumes that the line number is known.
 type LineRange = std::ops::Range<usize>;
 
@@ -284,7 +297,7 @@ impl<'a> Completer<'a> for MarkdownLinkCompleter<'a> {
                     .unwrap_or(file_name.to_string()),
                 reftext
                     .map(|it| it.range())
-                    .unwrap_or(character - 1..character - 1),
+                    .unwrap_or(character.saturating_sub(1)..character.saturating_sub(1)),
             ), // range shouldn't matter if no path specified.
             display: (display.as_str().to_string(), display.range()),
             infile_ref: partial_infileref,
@@ -465,7 +478,7 @@ impl<'a> Completer<'a> for WikiLinkCompleter<'a> {
         let line_chars = vault.select_line(path, line as isize)?;
 
         let index = line_chars
-            .get(0..=(character.min(line_chars.len() - 1)))? // select only the characters up to the cursor
+            .get(0..=(character.min(line_chars.len().checked_sub(1)?)))? // select only the characters up to the cursor
             .iter()
             .enumerate() // attach indexes
             .tuple_windows() // window into pairs of characters
@@ -951,7 +964,7 @@ impl MDDailyNote<'_> {
         date: NaiveDate,
         completer: &impl LinkCompleter<'a>,
     ) -> Option<MDDailyNote<'a>> {
-        let filerefname = date.format(&completer.settings().dailynote).to_string();
+        let filerefname = format_date(date, &completer.settings().dailynote)?;
         let match_string = format!("{}: {}", Self::relative_date_string(date)?, filerefname);
 
         // path on unresolved file is useless
