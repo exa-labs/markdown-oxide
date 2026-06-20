@@ -111,6 +111,8 @@ impl Backend {
             .log_message(MessageType::LOG, "Update Vault Started")
             .await;
 
+        let timer = std::time::Instant::now();
+
         let Ok(path) = params.uri.to_file_path() else {
             self.client
                 .log_message(MessageType::ERROR, "Failed to parse URI path")
@@ -133,7 +135,10 @@ impl Backend {
         drop(guard);
 
         self.client
-            .log_message(MessageType::LOG, "Update Vault Done")
+            .log_message(
+                MessageType::INFO,
+                format!("update_vault took {:.2}ms", timer.elapsed().as_secs_f64() * 1000.0),
+            )
             .await;
 
         self.schedule_diagnostics();
@@ -179,7 +184,7 @@ impl Backend {
         if elapsed.as_millis() > 10 {
             self.client
                 .log_message(
-                    MessageType::LOG,
+                    MessageType::INFO,
                     format!("Vault Construction took {}ms", elapsed.as_millis()),
                 )
                 .await;
@@ -236,8 +241,8 @@ impl Backend {
 
         self.client
             .log_message(
-                MessageType::LOG,
-                format!("Diagnostics Done took {}ms", elapsed.as_millis()),
+                MessageType::INFO,
+                format!("Diagnostics took {}ms", elapsed.as_millis()),
             )
             .await;
 
@@ -291,6 +296,27 @@ impl Backend {
         // `reconstruct_vault` performs blocking disk I/O across the whole vault.
         // Offload it from the async worker thread so the runtime stays responsive.
         tokio::task::block_in_place(|| catch_panic("vault update", || callback(vault)))
+    }
+
+    /// Times an LSP request and logs its duration at INFO so slow requests
+    /// (go-to-definition, references, code actions, completion, ...) are visible
+    /// in the editor's LSP log. Logs whether the request succeeded or errored.
+    async fn timed<T>(
+        &self,
+        label: &str,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let start = std::time::Instant::now();
+        let result = fut.await;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("{label} took {ms:.2}ms ({outcome})"),
+            )
+            .await;
+        result
     }
 
     async fn bind_settings<T>(&self, callback: impl FnOnce(&Settings) -> Result<T>) -> Result<T> {
@@ -509,10 +535,12 @@ impl LanguageServer for Backend {
     }
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
-        let path = params_path!(params)?;
-
-        self.bind_vault(|vault| Ok(codelens::code_lens(vault, &path, &params)))
-            .await
+        self.timed("textDocument/codeLens", async {
+            let path = params_path!(params)?;
+            self.bind_vault(|vault| Ok(codelens::code_lens(vault, &path, &params)))
+                .await
+        })
+        .await
     }
 
     async fn initialized(&self, _: InitializedParams) {
@@ -650,58 +678,49 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        self.bind_vault(|vault| {
-            let path = params_path!(params.text_document_position_params)?;
-            Ok(
-                goto_definition(vault, params.text_document_position_params.position, &path)
-                    .map(GotoDefinitionResponse::Array),
-            )
-        })
+        self.timed(
+            "textDocument/definition",
+            self.bind_vault(|vault| {
+                let path = params_path!(params.text_document_position_params)?;
+                Ok(
+                    goto_definition(vault, params.text_document_position_params.position, &path)
+                        .map(GotoDefinitionResponse::Array),
+                )
+            }),
+        )
         .await
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        self.bind_vault(|vault| {
-            let path = params_position_path!(params)?;
-            Ok(references(
-                vault,
-                params.text_document_position.position,
-                &path,
-            ))
-        })
+        self.timed(
+            "textDocument/references",
+            self.bind_vault(|vault| {
+                let path = params_position_path!(params)?;
+                Ok(references(
+                    vault,
+                    params.text_document_position.position,
+                    &path,
+                ))
+            }),
+        )
         .await
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        self.client
-            .log_message(MessageType::LOG, "Completions Started")
-            .await;
+        self.timed("textDocument/completion", async {
+            let path = params_position_path!(params)?;
+            let files = self
+                .bind_opened_files(|files| Ok(files.clone().into_iter().collect::<Box<[_]>>()))
+                .await?;
 
-        let timer = std::time::Instant::now();
+            let Ok(settings) = self.bind_settings(|settings| Ok(settings.to_owned())).await else {
+                return Err(Error::new(ErrorCode::ServerError(2)));
+            }; // TODO: this is bad
 
-        let path = params_position_path!(params)?;
-        let files = self
-            .bind_opened_files(|files| Ok(files.clone().into_iter().collect::<Box<[_]>>()))
-            .await?;
-
-        let Ok(settings) = self.bind_settings(|settings| Ok(settings.to_owned())).await else {
-            return Err(Error::new(ErrorCode::ServerError(2)));
-        }; // TODO: this is bad
-
-        let res = self
-            .bind_vault(|vault| Ok(get_completions(vault, &files, &params, &path, &settings)))
-            .await;
-
-        let elapsed = timer.elapsed();
-
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!("Completions Done took {}ms", elapsed.as_millis()),
-            )
-            .await;
-
-        res
+            self.bind_vault(|vault| Ok(get_completions(vault, &files, &params, &path, &settings)))
+                .await
+        })
+        .await
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
@@ -799,10 +818,13 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
-        self.bind_vault(|vault| {
-            let path = params_path!(params.text_document_position_params)?;
-            Ok(hover::hover(vault, &params, &path, &settings))
+        self.timed("textDocument/hover", async {
+            let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
+            self.bind_vault(|vault| {
+                let path = params_path!(params.text_document_position_params)?;
+                Ok(hover::hover(vault, &params, &path, &settings))
+            })
+            .await
         })
         .await
     }
@@ -811,10 +833,13 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        self.bind_vault(|vault| {
-            let path = params_path!(params)?;
-            Ok(document_symbol(vault, &params, &path))
-        })
+        self.timed(
+            "textDocument/documentSymbol",
+            self.bind_vault(|vault| {
+                let path = params_path!(params)?;
+                Ok(document_symbol(vault, &params, &path))
+            }),
+        )
         .await
     }
 
@@ -822,24 +847,33 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        self.bind_vault(|vault| Ok(workspace_symbol(vault, &params)))
-            .await
+        self.timed(
+            "workspace/symbol",
+            self.bind_vault(|vault| Ok(workspace_symbol(vault, &params))),
+        )
+        .await
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        self.bind_vault(|vault| {
-            let path = params_position_path!(params)?;
-            Ok(rename::rename(vault, &params, &path))
-        })
+        self.timed(
+            "textDocument/rename",
+            self.bind_vault(|vault| {
+                let path = params_position_path!(params)?;
+                Ok(rename::rename(vault, &params, &path))
+            }),
+        )
         .await
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
+        self.timed("textDocument/codeAction", async {
+            let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
 
-        self.bind_vault(|vault| {
-            let path = params_path!(params)?;
-            Ok(codeactions::code_actions(vault, &params, &path, &settings))
+            self.bind_vault(|vault| {
+                let path = params_path!(params)?;
+                Ok(codeactions::code_actions(vault, &params, &path, &settings))
+            })
+            .await
         })
         .await
     }
@@ -848,32 +882,22 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
+        self.timed("textDocument/semanticTokens/full", async {
+            let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
 
-        let timer = std::time::Instant::now();
-
-        let path = params_path!(params)?;
-        let res = self
-            .bind_vault(|vault| {
+            let path = params_path!(params)?;
+            self.bind_vault(|vault| {
                 Ok(tokens::semantic_tokens_full(
                     vault, &path, params, &settings,
                 ))
             })
-            .await;
-
-        let elapsed = timer.elapsed();
-
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!("Semantic Tokens Done took {}ms", elapsed.as_millis()),
-            )
-            .await;
-
-        return res;
+            .await
+        })
+        .await
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.timed("textDocument/inlayHint", async {
         let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
         if !settings.inlay_hints {
             return Ok(None);
@@ -972,6 +996,8 @@ impl LanguageServer for Backend {
             .await;
 
         hints
+        })
+        .await
     }
 }
 
