@@ -664,8 +664,7 @@ impl MDFile {
         let code_blocks = MDCodeBlock::new(text).collect_vec();
         let file_name = path
             .file_stem()
-            .expect("file should have file stem")
-            .to_str()
+            .and_then(|stem| stem.to_str())
             .unwrap_or_default();
         let links = match context {
             Settings {

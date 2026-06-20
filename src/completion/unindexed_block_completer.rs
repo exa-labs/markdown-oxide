@@ -213,11 +213,11 @@ impl<'a> UnindexedBlock<'a> {
                                         range: Range {
                                             start: Position {
                                                 line: block.range.end.line,
-                                                character: block.range.end.character - 1,
+                                                character: block.range.end.character.saturating_sub(1),
                                             },
                                             end: Position {
                                                 line: block.range.end.line,
-                                                character: block.range.end.character - 1,
+                                                character: block.range.end.character.saturating_sub(1),
                                             },
                                         },
                                         new_text: format!("   ^{}", rand_id),

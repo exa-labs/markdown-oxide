@@ -1,7 +1,11 @@
+use std::backtrace::Backtrace;
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use completion::get_completions;
 use config::{EmbeddedBlockTransclusionLength, Settings};
@@ -38,12 +42,34 @@ mod tokens;
 mod ui;
 mod vault;
 
-#[derive(Debug)]
+/// Maximum number of LSP requests processed concurrently by the server.
+///
+/// The forked `tower-lsp` defaults this to 4. That is far too low: a few slow
+/// requests saturate every slot, the server's bounded message queue fills, and
+/// the stdin reader blocks — at which point `shutdown` and `$/cancelRequest` are
+/// never read and the server appears to hang. A higher limit keeps the server
+/// responsive under load (and keeps `$/cancelRequest` enabled).
+const MAX_REQUEST_CONCURRENCY: usize = 256;
+
+/// Debounce window for diagnostics.
+///
+/// Diagnostics are O(open_files × references × referenceables) and were
+/// previously recomputed synchronously on every keystroke. In a long session
+/// with many open buffers, each pass grows until it takes longer than the gap
+/// between edits; the passes then pile up faster than they complete, the
+/// server's bounded message queue fills, the stdin reader blocks, and the
+/// server goes silent (the reported crash loop). Coalescing edits so only the
+/// latest change in a quiet window is computed keeps the load bounded.
+const DIAGNOSTICS_DEBOUNCE_MS: u64 = 300;
+
+#[derive(Debug, Clone)]
 struct Backend {
     client: Client,
     vault: Arc<RwLock<Option<Vault>>>,
     opened_files: Arc<RwLock<HashSet<PathBuf>>>,
     settings: Arc<RwLock<Option<Settings>>>,
+    /// Monotonic counter bumped on every change, used to debounce diagnostics.
+    diag_gen: Arc<AtomicU64>,
 }
 
 struct TextDocumentItem {
@@ -52,10 +78,40 @@ struct TextDocumentItem {
 }
 
 impl Backend {
+    /// Schedule a debounced diagnostics pass.
+    ///
+    /// Each edit bumps the generation counter and spawns a task that waits for a
+    /// short quiet window; only the task whose generation is still current then
+    /// computes diagnostics. Bursts of keystrokes therefore collapse into a
+    /// single diagnostics run instead of one (expensive, lock-holding) run per
+    /// keystroke, which is what previously wedged the server.
+    fn schedule_diagnostics(&self) {
+        let generation = self.diag_gen.fetch_add(1, Ordering::SeqCst) + 1;
+        let backend = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(DIAGNOSTICS_DEBOUNCE_MS)).await;
+            // A newer edit arrived during the debounce window; let its task run.
+            if backend.diag_gen.load(Ordering::SeqCst) != generation {
+                return;
+            }
+            if let Err(e) = backend.publish_diagnostics().await {
+                backend
+                    .client
+                    .log_message(
+                        MessageType::ERROR,
+                        format!("Failed calculating diagnostics {:?}", e),
+                    )
+                    .await;
+            }
+        });
+    }
+
     async fn update_vault(&self, params: TextDocumentItem) {
         self.client
             .log_message(MessageType::LOG, "Update Vault Started")
             .await;
+
+        let timer = std::time::Instant::now();
 
         let Ok(path) = params.uri.to_file_path() else {
             self.client
@@ -79,20 +135,13 @@ impl Backend {
         drop(guard);
 
         self.client
-            .log_message(MessageType::LOG, "Update Vault Done")
+            .log_message(
+                MessageType::INFO,
+                format!("update_vault took {:.2}ms", timer.elapsed().as_secs_f64() * 1000.0),
+            )
             .await;
 
-        match self.publish_diagnostics().await {
-            Ok(_) => (),
-            Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Failed calculating diagnostics on vault update {:?}", e),
-                    )
-                    .await
-            }
-        }
+        self.schedule_diagnostics();
 
         if settings.semantic_tokens {
             let _ = self.client.semantic_tokens_refresh().await;
@@ -135,26 +184,13 @@ impl Backend {
         if elapsed.as_millis() > 10 {
             self.client
                 .log_message(
-                    MessageType::LOG,
+                    MessageType::INFO,
                     format!("Vault Construction took {}ms", elapsed.as_millis()),
                 )
                 .await;
         }
 
-        match self.publish_diagnostics().await {
-            Ok(_) => (),
-            Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!(
-                            "Failed calculating diagnostics on vault construction {:?}",
-                            e
-                        ),
-                    )
-                    .await
-            }
-        };
+        self.schedule_diagnostics();
 
         if settings.semantic_tokens {
             let _ = self.client.semantic_tokens_refresh().await;
@@ -205,8 +241,8 @@ impl Backend {
 
         self.client
             .log_message(
-                MessageType::LOG,
-                format!("Diagnostics Done took {}ms", elapsed.as_millis()),
+                MessageType::INFO,
+                format!("Diagnostics took {}ms", elapsed.as_millis()),
             )
             .await;
 
@@ -228,7 +264,13 @@ impl Backend {
             return Err(Error::new(ErrorCode::ServerError(0)));
         };
 
-        callback(vault)
+        // Vault queries (go-to-definition, code actions, diagnostics, ...) are
+        // synchronous and CPU-bound. Running them directly on a Tokio worker
+        // thread blocks the async runtime, so under sustained load the stdin
+        // reader and the `shutdown`/`$/cancelRequest` handlers can no longer be
+        // scheduled and the server goes silent. `block_in_place` moves the work
+        // off the runtime's core threads so I/O and control messages keep flowing.
+        tokio::task::block_in_place(|| catch_panic("vault query", || callback(vault)))
     }
 
     async fn bind_vault_mut<T>(&self, callback: impl Fn(&mut Vault) -> Result<T>) -> Result<T> {
@@ -250,7 +292,31 @@ impl Backend {
             return Err(Error::new(ErrorCode::ServerError(0)));
         };
 
-        callback(vault)
+        // See `bind_vault`: vault construction/update is synchronous, and
+        // `reconstruct_vault` performs blocking disk I/O across the whole vault.
+        // Offload it from the async worker thread so the runtime stays responsive.
+        tokio::task::block_in_place(|| catch_panic("vault update", || callback(vault)))
+    }
+
+    /// Times an LSP request and logs its duration at INFO so slow requests
+    /// (go-to-definition, references, code actions, completion, ...) are visible
+    /// in the editor's LSP log. Logs whether the request succeeded or errored.
+    async fn timed<T>(
+        &self,
+        label: &str,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let start = std::time::Instant::now();
+        let result = fut.await;
+        let ms = start.elapsed().as_secs_f64() * 1000.0;
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        self.client
+            .log_message(
+                MessageType::INFO,
+                format!("{label} took {ms:.2}ms ({outcome})"),
+            )
+            .await;
+        result
     }
 
     async fn bind_settings<T>(&self, callback: impl FnOnce(&Settings) -> Result<T>) -> Result<T> {
@@ -469,10 +535,12 @@ impl LanguageServer for Backend {
     }
 
     async fn code_lens(&self, params: CodeLensParams) -> Result<Option<Vec<CodeLens>>> {
-        let path = params_path!(params)?;
-
-        self.bind_vault(|vault| Ok(codelens::code_lens(vault, &path, &params)))
-            .await
+        self.timed("textDocument/codeLens", async {
+            let path = params_path!(params)?;
+            self.bind_vault(|vault| Ok(codelens::code_lens(vault, &path, &params)))
+                .await
+        })
+        .await
     }
 
     async fn initialized(&self, _: InitializedParams) {
@@ -569,17 +637,7 @@ impl LanguageServer for Backend {
             .await; // usually, this is not necesary; however some may start the LS without saving a changed file, so it is necessary
         } // drop the lock
 
-        match self.publish_diagnostics().await {
-            Ok(_) => (),
-            Err(e) => {
-                self.client
-                    .log_message(
-                        MessageType::ERROR,
-                        format!("Failed calculating diagnostics on file open {:?}", e),
-                    )
-                    .await
-            }
-        }
+        // `update_vault` already scheduled a (debounced) diagnostics pass.
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -598,10 +656,16 @@ impl LanguageServer for Backend {
         }
     }
 
-    async fn did_change(&self, mut params: DidChangeTextDocumentParams) {
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        // markdown-oxide negotiates full-document sync, so the final change holds
+        // the complete new text. The list can legitimately be empty (the LSP spec
+        // allows it), so don't index into it unconditionally.
+        let Some(change) = params.content_changes.into_iter().last() else {
+            return;
+        };
         self.update_vault(TextDocumentItem {
             uri: params.text_document.uri,
-            text: params.content_changes.remove(0).text,
+            text: change.text,
         })
         .await;
     }
@@ -614,58 +678,49 @@ impl LanguageServer for Backend {
         &self,
         params: GotoDefinitionParams,
     ) -> Result<Option<GotoDefinitionResponse>> {
-        self.bind_vault(|vault| {
-            let path = params_path!(params.text_document_position_params)?;
-            Ok(
-                goto_definition(vault, params.text_document_position_params.position, &path)
-                    .map(GotoDefinitionResponse::Array),
-            )
-        })
+        self.timed(
+            "textDocument/definition",
+            self.bind_vault(|vault| {
+                let path = params_path!(params.text_document_position_params)?;
+                Ok(
+                    goto_definition(vault, params.text_document_position_params.position, &path)
+                        .map(GotoDefinitionResponse::Array),
+                )
+            }),
+        )
         .await
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        self.bind_vault(|vault| {
-            let path = params_position_path!(params)?;
-            Ok(references(
-                vault,
-                params.text_document_position.position,
-                &path,
-            ))
-        })
+        self.timed(
+            "textDocument/references",
+            self.bind_vault(|vault| {
+                let path = params_position_path!(params)?;
+                Ok(references(
+                    vault,
+                    params.text_document_position.position,
+                    &path,
+                ))
+            }),
+        )
         .await
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        self.client
-            .log_message(MessageType::LOG, "Completions Started")
-            .await;
+        self.timed("textDocument/completion", async {
+            let path = params_position_path!(params)?;
+            let files = self
+                .bind_opened_files(|files| Ok(files.clone().into_iter().collect::<Box<[_]>>()))
+                .await?;
 
-        let timer = std::time::Instant::now();
+            let Ok(settings) = self.bind_settings(|settings| Ok(settings.to_owned())).await else {
+                return Err(Error::new(ErrorCode::ServerError(2)));
+            }; // TODO: this is bad
 
-        let path = params_position_path!(params)?;
-        let files = self
-            .bind_opened_files(|files| Ok(files.clone().into_iter().collect::<Box<[_]>>()))
-            .await?;
-
-        let Ok(settings) = self.bind_settings(|settings| Ok(settings.to_owned())).await else {
-            return Err(Error::new(ErrorCode::ServerError(2)));
-        }; // TODO: this is bad
-
-        let res = self
-            .bind_vault(|vault| Ok(get_completions(vault, &files, &params, &path, &settings)))
-            .await;
-
-        let elapsed = timer.elapsed();
-
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!("Completions Done took {}ms", elapsed.as_millis()),
-            )
-            .await;
-
-        res
+            self.bind_vault(|vault| Ok(get_completions(vault, &files, &params, &path, &settings)))
+                .await
+        })
+        .await
     }
 
     async fn execute_command(&self, params: ExecuteCommandParams) -> Result<Option<Value>> {
@@ -763,10 +818,13 @@ impl LanguageServer for Backend {
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
-        self.bind_vault(|vault| {
-            let path = params_path!(params.text_document_position_params)?;
-            Ok(hover::hover(vault, &params, &path, &settings))
+        self.timed("textDocument/hover", async {
+            let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
+            self.bind_vault(|vault| {
+                let path = params_path!(params.text_document_position_params)?;
+                Ok(hover::hover(vault, &params, &path, &settings))
+            })
+            .await
         })
         .await
     }
@@ -775,10 +833,13 @@ impl LanguageServer for Backend {
         &self,
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
-        self.bind_vault(|vault| {
-            let path = params_path!(params)?;
-            Ok(document_symbol(vault, &params, &path))
-        })
+        self.timed(
+            "textDocument/documentSymbol",
+            self.bind_vault(|vault| {
+                let path = params_path!(params)?;
+                Ok(document_symbol(vault, &params, &path))
+            }),
+        )
         .await
     }
 
@@ -786,24 +847,33 @@ impl LanguageServer for Backend {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        self.bind_vault(|vault| Ok(workspace_symbol(vault, &params)))
-            .await
+        self.timed(
+            "workspace/symbol",
+            self.bind_vault(|vault| Ok(workspace_symbol(vault, &params))),
+        )
+        .await
     }
 
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        self.bind_vault(|vault| {
-            let path = params_position_path!(params)?;
-            Ok(rename::rename(vault, &params, &path))
-        })
+        self.timed(
+            "textDocument/rename",
+            self.bind_vault(|vault| {
+                let path = params_position_path!(params)?;
+                Ok(rename::rename(vault, &params, &path))
+            }),
+        )
         .await
     }
 
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
+        self.timed("textDocument/codeAction", async {
+            let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
 
-        self.bind_vault(|vault| {
-            let path = params_path!(params)?;
-            Ok(codeactions::code_actions(vault, &params, &path, &settings))
+            self.bind_vault(|vault| {
+                let path = params_path!(params)?;
+                Ok(codeactions::code_actions(vault, &params, &path, &settings))
+            })
+            .await
         })
         .await
     }
@@ -812,32 +882,22 @@ impl LanguageServer for Backend {
         &self,
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
-        let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
+        self.timed("textDocument/semanticTokens/full", async {
+            let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
 
-        let timer = std::time::Instant::now();
-
-        let path = params_path!(params)?;
-        let res = self
-            .bind_vault(|vault| {
+            let path = params_path!(params)?;
+            self.bind_vault(|vault| {
                 Ok(tokens::semantic_tokens_full(
                     vault, &path, params, &settings,
                 ))
             })
-            .await;
-
-        let elapsed = timer.elapsed();
-
-        self.client
-            .log_message(
-                MessageType::LOG,
-                format!("Semantic Tokens Done took {}ms", elapsed.as_millis()),
-            )
-            .await;
-
-        return res;
+            .await
+        })
+        .await
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        self.timed("textDocument/inlayHint", async {
         let settings = self.bind_settings(|settings| Ok(settings.clone())).await?;
         if !settings.inlay_hints {
             return Ok(None);
@@ -936,6 +996,8 @@ impl LanguageServer for Backend {
             .await;
 
         hints
+        })
+        .await
     }
 }
 
@@ -950,8 +1012,57 @@ async fn jump_to_specific(
 
 use clap::Parser;
 
+/// Runs synchronous, possibly-panicking vault work, converting a panic into a
+/// logged LSP error instead of letting it unwind into the request-dispatch loop.
+///
+/// A panic that escapes a handler kills the dispatch task: the process keeps
+/// running but stops reading stdin, so the editor sees the server go silent (no
+/// backtrace is logged because the process never exits). Catching it here turns
+/// a fatal silent hang into a single failed request. The panic itself is still
+/// fully reported (message + backtrace) by the global hook from `install_panic_hook`.
+fn catch_panic<T>(context: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(_) => Err(Error {
+            code: ErrorCode::InternalError,
+            message: format!("markdown-oxide handler panicked ({context}); see server log").into(),
+            data: None,
+        }),
+    }
+}
+
+/// Installs a global panic hook so every panic is reported with its message,
+/// location, and a full backtrace to stderr (which editors capture in their LSP
+/// log) and to a panic log file. Without this, panics are effectively invisible:
+/// they are caught at the task boundary and the server just stops responding.
+fn install_panic_hook() {
+    let log_path = std::env::temp_dir().join("markdown-oxide-panic.log");
+    eprintln!(
+        "[markdown-oxide] crash reporting enabled (panics -> stderr and {})",
+        log_path.display()
+    );
+    std::panic::set_hook(Box::new(move |info| {
+        let backtrace = Backtrace::force_capture();
+        let thread = std::thread::current();
+        let thread_name = thread.name().unwrap_or("<unnamed>");
+        let report = format!(
+            "\n==== MARKDOWN-OXIDE PANIC (thread: {thread_name}) ====\n{info}\nbacktrace:\n{backtrace}\n=====================================================\n"
+        );
+        eprint!("{report}");
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)
+        {
+            use std::io::Write;
+            let _ = file.write_all(report.as_bytes());
+        }
+    }));
+}
+
 #[tokio::main]
 async fn main() {
+    install_panic_hook();
     let cli = cli::Cli::parse();
 
     match cli.command {
@@ -978,8 +1089,17 @@ async fn main() {
                 vault: Arc::new(None.into()),
                 opened_files: Arc::new(HashSet::new().into()),
                 settings: Arc::new(None.into()),
+                diag_gen: Arc::new(AtomicU64::new(0)),
             });
-            Server::new(stdin, stdout, socket).serve(service).await;
+            // The default request concurrency limit is 4. With only 4 slots, a
+            // few slow requests fill the server's bounded message queue, which
+            // blocks the stdin reader and prevents `shutdown`/`$/cancelRequest`
+            // from being processed (the server appears to hang). A higher limit
+            // keeps the server responsive and keeps `$/cancelRequest` enabled.
+            Server::new(stdin, stdout, socket)
+                .concurrency_level(MAX_REQUEST_CONCURRENCY)
+                .serve(service)
+                .await;
         }
     }
 }

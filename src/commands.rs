@@ -9,19 +9,27 @@ use serde_json::Value;
 use tower_lsp::jsonrpc::{Error, Result};
 use tower_lsp::lsp_types::{MessageType, ShowDocumentParams, Url};
 
+/// Formats a date/time with a user-supplied chrono format string without
+/// panicking. `format(...).to_string()` panics on an invalid format specifier
+/// (chrono's `Display` returns an error and `to_string` unwraps it); `write!`
+/// surfaces it as `Err` instead, so a misconfigured `dailynote` yields `None`.
 fn datetime_to_file(
     datetime: NaiveDateTime,
     dailynote_format: &str,
     root_dir: &Path,
 ) -> Option<Url> {
-    let filename = datetime.format(dailynote_format).to_string();
+    use std::fmt::Write;
+    let mut filename = String::new();
+    write!(filename, "{}", datetime.format(dailynote_format)).ok()?;
     let path = root_dir.join(&filename);
 
     Url::from_file_path(path.with_extension("md")).ok()
 }
 
 fn date_to_file(date: NaiveDate, dailynote_format: &str, root_dir: &Path) -> Option<Url> {
-    let filename = date.format(dailynote_format).to_string();
+    use std::fmt::Write;
+    let mut filename = String::new();
+    write!(filename, "{}", date.format(dailynote_format)).ok()?;
     let path = root_dir.join(&filename);
 
     Url::from_file_path(path.with_extension("md")).ok()
