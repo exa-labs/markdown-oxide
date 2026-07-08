@@ -7,7 +7,7 @@ use std::{
     hash::Hash,
     iter,
     ops::{Deref, DerefMut, Not, Range},
-    path::{Path, PathBuf, MAIN_SEPARATOR},
+    path::{Component, Path, PathBuf, MAIN_SEPARATOR},
     time::SystemTime,
 };
 
@@ -319,6 +319,14 @@ impl Vault {
                         .par_bridge()
                         .into_par_iter()
                         .filter(|(_, reference)| {
+                            // Attachments and links that step outside the vault are not
+                            // vault notes and should not show up as referenceables.
+                            if reference.is_attachment()
+                                || reference.is_outside_vault(self.root_dir())
+                            {
+                                return false;
+                            }
+
                             let ref_text = &reference.data().reference_text;
                             // Normalize only the heading portion (after #) of the
                             // reference text so that e.g. "file#Some Heading" matches
@@ -864,12 +872,53 @@ impl Reference {
         }
     }
 
+    /// The file path component of the reference, without any `#heading` or
+    /// `#^block` suffix and without the `.md` ending normalization.
+    pub fn file_path_part(&self) -> Option<&str> {
+        match self {
+            WikiFileLink(ReferenceData { reference_text, .. })
+            | MDFileLink(ReferenceData { reference_text, .. }) => Some(reference_text),
+            WikiHeadingLink(ReferenceData { reference_text, .. }, _, _)
+            | MDHeadingLink(ReferenceData { reference_text, .. }, _, _) => {
+                reference_text.split_once('#').map(|(file, _)| file)
+            }
+            WikiIndexedBlockLink(ReferenceData { reference_text, .. }, _, _)
+            | MDIndexedBlockLink(ReferenceData { reference_text, .. }, _, _) => {
+                reference_text.split_once("#^").map(|(file, _)| file)
+            }
+            Tag(_) | Footnote(_) | LinkRef(_) => None,
+        }
+    }
+
+    /// Returns true when this reference points to a non-markdown file (image,
+    /// PDF, etc.) rather than a vault note.
+    pub fn is_attachment(&self) -> bool {
+        self.file_path_part()
+            .is_some_and(|path| has_non_markdown_extension(path))
+    }
+
+    pub fn target_path(&self, root_dir: &Path) -> Option<PathBuf> {
+        let file_part = self.file_path_part()?;
+        if file_part.starts_with("http://")
+            || file_part.starts_with("https://")
+            || file_part.starts_with("data:")
+        {
+            return None;
+        }
+        Some(root_dir.join(file_part))
+    }
+
+    pub fn is_outside_vault(&self, root_dir: &Path) -> bool {
+        self.target_path(root_dir)
+            .is_some_and(|target| is_outside_vault(root_dir, &target))
+    }
+
     pub fn new<'a>(text: &'a str, file_name: &'a str) -> impl Iterator<Item = Reference> + 'a {
         static WIKI_LINK_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\[\[(?<filepath>[^\[\]\|\#]+?)?(?<ending>\.md)?(\#(?<infileref>[^\[\]\|]+))?(\|(?<display>[^\[\]\|]+))?\]\]")
+            Regex::new(r"!?\[\[(?<filepath>[^\[\]\|\#]+?)?(?<ending>\.md)?(\#(?<infileref>[^\[\]\|]+))?(\|(?<display>[^\[\]\|]+))?\]\]")
 
                 .unwrap()
-        }); // A [[link]] that does not have any [ or ] in it
+        }); // A [[link]] or ![[embed]] that does not have any [ or ] in it
 
         let wiki_links = WIKI_LINK_RE
             .captures_iter(text)
@@ -885,9 +934,9 @@ impl Reference {
             });
 
         static MD_LINK_RE: Lazy<Regex> = Lazy::new(|| {
-            Regex::new(r"\[(?<display>[^\[\]]*?)\]\(<?(?<filepath>(\.?\/)?[^\[\]\|\#<>]+?)?(?<ending>\.md)?(\#(?<infileref>[^\[\]\|<>]+?))?>?\)")
+            Regex::new(r"!?\[(?<display>[^\[\]]*?)\]\(<?(?<filepath>(\.?\/)?[^\[\]\|\#<>]+?)?(?<ending>\.md)?(\#(?<infileref>[^\[\]\|<>]+?))?>?\)")
                 .expect("MD Link Not Constructing")
-        }); // [display](relativePath)
+        }); // [display](relativePath) or ![alt](relativePath)
 
         let md_links = MD_LINK_RE
             .captures_iter(text)
@@ -1087,12 +1136,10 @@ struct RegexTuple<'a> {
     file_path: Option<Match<'a>>,
     infile_ref: Option<Match<'a>>,
     display_text: Option<Match<'a>>,
-    has_md_ending: bool,
 }
 
 impl RegexTuple<'_> {
     fn new(capture: Captures) -> Option<RegexTuple> {
-        let has_md_ending = capture.name("ending").is_some();
         match (
             capture.get(0),
             capture.name("filepath"),
@@ -1104,7 +1151,6 @@ impl RegexTuple<'_> {
                 file_path,
                 infile_ref,
                 display_text,
-                has_md_ending,
             }),
             _ => None,
         }
@@ -1154,6 +1200,29 @@ fn has_non_markdown_extension(path: &str) -> bool {
     NON_MD_EXT_RE.is_match(path)
 }
 
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::RootDir | Component::Prefix(_) => {
+                normalized = PathBuf::from(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            Component::Normal(c) => {
+                normalized.push(c);
+            }
+        }
+    }
+    normalized
+}
+
+fn is_outside_vault(root_dir: &Path, target: &Path) -> bool {
+    !normalize_path(target).starts_with(normalize_path(root_dir))
+}
+
 fn generic_link_constructor<T: ParseableReferenceConstructor>(
     text: &str,
     file_name: &str,
@@ -1162,7 +1231,6 @@ fn generic_link_constructor<T: ParseableReferenceConstructor>(
         file_path,
         infile_ref,
         display_text,
-        has_md_ending,
     }: RegexTuple,
 ) -> Option<Reference> {
     if file_path.is_some_and(|path| {
@@ -1173,12 +1241,10 @@ fn generic_link_constructor<T: ParseableReferenceConstructor>(
         return None;
     }
 
-    // Filter out file paths that end with known non-markdown extensions
-    // (e.g., .png, .pdf, .jpg). These are attachment/media references, not note links.
-    // Skip this check if .md was explicitly present (e.g., [[image.png.md]] is a valid note).
-    if !has_md_ending && file_path.is_some_and(|path| has_non_markdown_extension(path.as_str())) {
-        return None;
-    }
+    // We no longer drop non-markdown file links here. Image/attachment links are
+    // still parsed so diagnostics can detect when they point outside the vault.
+    // The unresolved-referenceable pass later filters them out of completions,
+    // hover, and code actions (see `Reference::is_attachment`).
 
     let decoded_filepath = file_path
         .map(|file_path| {
@@ -1806,9 +1872,10 @@ mod vault_tests {
     use std::{collections::HashMap, path::Path, path::PathBuf};
 
     use itertools::Itertools;
-    use tower_lsp::lsp_types::{ClientCapabilities, Position, Range};
+    use tower_lsp::lsp_types::{ClientCapabilities, Position, Range, Url};
 
     use crate::config::Settings;
+    use crate::diagnostics::{diagnostics, path_unresolved_references};
     use crate::vault::{HeadingLevel, ReferenceData};
     use crate::vault::{MDLinkReferenceDefinition, Refname};
 
@@ -2344,23 +2411,41 @@ mod vault_tests {
         let text = "This is a png [[link.png]] [[link|display.png]]";
         let parsed = Reference::new(text, "test.md").collect_vec();
 
-        // [[link.png]] is filtered out because .png is a known non-markdown extension.
-        // [[link|display.png]] is a valid link to note "link" with display text "display.png".
-        let expected = vec![WikiFileLink(ReferenceData {
-            reference_text: "link".into(),
-            range: tower_lsp::lsp_types::Range {
-                start: tower_lsp::lsp_types::Position {
-                    line: 0,
-                    character: 27,
-                },
-                end: tower_lsp::lsp_types::Position {
-                    line: 0,
-                    character: 47,
-                },
-            }
-            .into(),
-            display_text: Some("display.png".into()),
-        })];
+        // Both links are now parsed. [[link.png]] is treated as an attachment link,
+        // and [[link|display.png]] is a valid link to note "link" with display text
+        // "display.png".
+        let expected = vec![
+            WikiFileLink(ReferenceData {
+                reference_text: "link.png".into(),
+                range: tower_lsp::lsp_types::Range {
+                    start: tower_lsp::lsp_types::Position {
+                        line: 0,
+                        character: 14,
+                    },
+                    end: tower_lsp::lsp_types::Position {
+                        line: 0,
+                        character: 26,
+                    },
+                }
+                .into(),
+                ..ReferenceData::default()
+            }),
+            WikiFileLink(ReferenceData {
+                reference_text: "link".into(),
+                range: tower_lsp::lsp_types::Range {
+                    start: tower_lsp::lsp_types::Position {
+                        line: 0,
+                        character: 27,
+                    },
+                    end: tower_lsp::lsp_types::Position {
+                        line: 0,
+                        character: 47,
+                    },
+                }
+                .into(),
+                display_text: Some("display.png".into()),
+            }),
+        ];
 
         assert_eq!(parsed, expected)
     }
@@ -3432,5 +3517,148 @@ Some content here";
         })];
 
         assert_eq!(parsed, expected);
+    }
+
+    #[test]
+    fn wiki_image_embed_parsing() {
+        let text = "![[image.png]]";
+        let parsed = Reference::new(text, "test.md").collect_vec();
+
+        let expected = vec![WikiFileLink(ReferenceData {
+            reference_text: "image.png".into(),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 14,
+                },
+            }
+            .into(),
+            ..ReferenceData::default()
+        })];
+
+        assert_eq!(parsed, expected);
+        assert!(parsed[0].is_attachment());
+        assert!(!parsed[0].is_outside_vault(Path::new("/vault")));
+    }
+
+    #[test]
+    fn md_image_link_parsing() {
+        let text = "![alt](image.png)";
+        let parsed = Reference::new(text, "test.md").collect_vec();
+
+        let expected = vec![MDFileLink(ReferenceData {
+            reference_text: "image.png".into(),
+            display_text: Some("alt".into()),
+            range: Range {
+                start: Position {
+                    line: 0,
+                    character: 0,
+                },
+                end: Position {
+                    line: 0,
+                    character: 17,
+                },
+            }
+            .into(),
+        })];
+
+        assert_eq!(parsed, expected);
+        assert!(parsed[0].is_attachment());
+    }
+
+    #[test]
+    fn reference_is_attachment() {
+        let text = "[[image.png]] [[note]] [alt](image.png) [text](note.md) [[image.png#caption]]";
+        let parsed = Reference::new(text, "test.md").collect_vec();
+
+        assert_eq!(parsed.len(), 5);
+        assert!(parsed[0].is_attachment());
+        assert!(!parsed[1].is_attachment());
+        assert!(parsed[2].is_attachment());
+        assert!(parsed[3].is_attachment());
+        assert!(!parsed[4].is_attachment());
+    }
+
+    #[test]
+    fn diagnostics_flag_out_of_vault_references() {
+        let root = PathBuf::from("/tmp/moxide-out-of-vault-test");
+        let note_path = root.join("note.md");
+        let note_text = "See [[inside.png]] and [[../outside.png]]. \
+Also ![alt](../outside.pdf), [[/absolute/outside]], and [[missing]].";
+
+        let mut md_files = HashMap::new();
+        md_files.insert(
+            note_path.clone(),
+            MDFile::new(&test_settings(), note_text, note_path.clone()),
+        );
+
+        let vault = Vault {
+            md_files: md_files.into(),
+            ropes: HashMap::new().into(),
+            root_dir: root,
+        };
+
+        let diagnostics = diagnostics(
+            &vault,
+            &test_settings(),
+            (&note_path, &Url::from_file_path(&note_path).unwrap()),
+        )
+        .unwrap();
+
+        let messages: Vec<_> = diagnostics.iter().map(|d| d.message.clone()).collect();
+        assert_eq!(messages.len(), 4);
+        assert_eq!(
+            messages
+                .iter()
+                .filter(|m| *m == "Attachment outside vault")
+                .count(),
+            2
+        );
+        assert!(messages.contains(&"Link target outside vault".to_string()));
+        assert!(messages.contains(&"Unresolved Reference".to_string()));
+
+        // The in-vault attachment and the out-of-vault markdown link should not
+        // be reported as unresolved references.
+        let unresolved = path_unresolved_references(&vault, &note_path)
+            .unwrap()
+            .into_iter()
+            .map(|(_, r)| r.data().reference_text.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(unresolved, vec!["missing".to_string()]);
+    }
+
+    #[test]
+    fn out_of_vault_diagnostics_count_duplicates() {
+        let root = PathBuf::from("/tmp/moxide-out-of-vault-dupes");
+        let note_path = root.join("note.md");
+        let note_text = "[[../outside.png]] [[../outside.png]]";
+
+        let mut md_files = HashMap::new();
+        md_files.insert(
+            note_path.clone(),
+            MDFile::new(&test_settings(), note_text, note_path.clone()),
+        );
+
+        let vault = Vault {
+            md_files: md_files.into(),
+            ropes: HashMap::new().into(),
+            root_dir: root,
+        };
+
+        let diagnostics = diagnostics(
+            &vault,
+            &test_settings(),
+            (&note_path, &Url::from_file_path(&note_path).unwrap()),
+        )
+        .unwrap();
+
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics
+            .iter()
+            .all(|d| d.message == "Attachment outside vault used 2 times"));
     }
 }
