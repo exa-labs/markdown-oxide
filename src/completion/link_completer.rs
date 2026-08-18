@@ -745,9 +745,7 @@ impl LinkCompletion<'_> {
             },
             text_edit: Some(text_edit),
             preselect: Some(match self {
-                Self::DailyNote(daily) => {
-                    daily.relative_name(completer) == Some(completer.entered_refname())
-                }
+                Self::DailyNote(daily) => daily.relative_name() == completer.entered_refname(),
                 link_completion => link_completion.refname() == completer.entered_refname(),
             }),
             filter_text: Some(filter_text.to_string()),
@@ -790,7 +788,7 @@ impl<'a> Completable<'a, MarkdownLinkCompleter<'a>> for LinkCompletion<'a> {
                 match_string: _, ..
             } => None,
             Self::Alias { match_string, .. } => Some(match_string.to_string()),
-            Self::DailyNote(daily) => daily.relative_name(markdown_link_completer),
+            Self::DailyNote(daily) => Some(daily.relative_name().to_string()),
             Self::Heading {
                 heading,
                 match_string: _,
@@ -900,9 +898,8 @@ pub struct MDDailyNote<'a> {
 }
 
 impl MDDailyNote<'_> {
-    pub fn relative_name<'a>(&self, completer: &impl LinkCompleter<'a>) -> Option<String> {
-        let _ = completer;
-        Some(self.relative_name.clone())
+    pub fn relative_name(&self) -> &str {
+        &self.relative_name
     }
 
     fn relative_date_string(date: NaiveDate) -> Option<String> {
