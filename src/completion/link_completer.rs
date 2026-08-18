@@ -23,7 +23,7 @@ use crate::{
 };
 
 use super::{
-    matcher::{fuzzy_match_completions, Matchable, OrderedCompletion},
+    matcher::{fuzzy_match_completions, CompletionPriority, Matchable, OrderedCompletion},
     Completable, Completer, Context,
 };
 
@@ -544,9 +544,12 @@ impl<'a> Completer<'a> for WikiLinkCompleter<'a> {
                             .flat_map(move |referenceable| LinkCompletion::new(referenceable, self))
                             .flatten()
                             .flat_map(move |completion| {
+                                let priority = completion.priority();
+                                let sort_text =
+                                    format!("{}{:0>20}", priority as u8, modified_string);
+
                                 Some(OrderedCompletion::<WikiLinkCompleter, LinkCompletion>::new(
-                                    completion,
-                                    modified_string.clone(),
+                                    completion, sort_text,
                                 ))
                             }),
                     )
@@ -742,9 +745,7 @@ impl LinkCompletion<'_> {
             },
             text_edit: Some(text_edit),
             preselect: Some(match self {
-                Self::DailyNote(daily) => {
-                    daily.relative_name(completer) == Some(completer.entered_refname())
-                }
+                Self::DailyNote(daily) => daily.relative_name() == completer.entered_refname(),
                 link_completion => link_completion.refname() == completer.entered_refname(),
             }),
             filter_text: Some(filter_text.to_string()),
@@ -787,7 +788,7 @@ impl<'a> Completable<'a, MarkdownLinkCompleter<'a>> for LinkCompletion<'a> {
                 match_string: _, ..
             } => None,
             Self::Alias { match_string, .. } => Some(match_string.to_string()),
-            Self::DailyNote(daily) => daily.relative_name(markdown_link_completer),
+            Self::DailyNote(daily) => Some(daily.relative_name().to_string()),
             Self::Heading {
                 heading,
                 match_string: _,
@@ -878,26 +879,27 @@ impl Matchable for LinkCompletion<'_> {
             Alias { match_string, .. } => match_string,
         }
     }
+
+    fn priority(&self) -> CompletionPriority {
+        match self {
+            DailyNote(daily) if daily.relative_name == "today" => CompletionPriority::Top,
+            DailyNote(_) => CompletionPriority::Elevated,
+            _ => CompletionPriority::Normal,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct MDDailyNote<'a> {
     match_string: String,
     ref_name: String,
+    relative_name: String,
     real_referenceaable: Option<Referenceable<'a>>,
 }
 
 impl MDDailyNote<'_> {
-    pub fn relative_name<'a>(&self, completer: &impl LinkCompleter<'a>) -> Option<String> {
-        let self_date = self.get_self_date(completer)?;
-
-        Self::relative_date_string(self_date)
-    }
-
-    pub fn get_self_date<'a>(&self, completer: &impl LinkCompleter<'a>) -> Option<NaiveDate> {
-        let dailynote_format = &completer.settings().dailynote;
-
-        chrono::NaiveDate::parse_from_str(&self.ref_name, dailynote_format).ok()
+    pub fn relative_name(&self) -> &str {
+        &self.relative_name
     }
 
     fn relative_date_string(date: NaiveDate) -> Option<String> {
@@ -921,7 +923,7 @@ impl MDDailyNote<'_> {
         referenceable: Referenceable<'a>,
         completer: &impl LinkCompleter<'a>,
     ) -> Option<MDDailyNote<'a>> {
-        let (filerefname, filter_refname) = (match referenceable {
+        let (filerefname, relative_name, filter_refname) = (match referenceable {
             Referenceable::File(&ref path, _) | Referenceable::UnresovledFile(ref path, _) => {
                 let filename = path.file_name();
                 let dailynote_format = &completer.settings().dailynote;
@@ -934,8 +936,13 @@ impl MDDailyNote<'_> {
                     ))
                 })?;
 
-                date.and_then(Self::relative_date_string)
-                    .map(|thing| (filename.clone(), format!("{}: {}", thing, filename)))
+                date.and_then(Self::relative_date_string).map(|thing| {
+                    (
+                        filename.clone(),
+                        thing.clone(),
+                        format!("{}: {}", thing, filename),
+                    )
+                })
             }
             _ => None,
         })?;
@@ -943,6 +950,7 @@ impl MDDailyNote<'_> {
         Some(MDDailyNote {
             match_string: filter_refname,
             ref_name: filerefname,
+            relative_name,
             real_referenceaable: Some(referenceable),
         })
     }
@@ -952,12 +960,14 @@ impl MDDailyNote<'_> {
         completer: &impl LinkCompleter<'a>,
     ) -> Option<MDDailyNote<'a>> {
         let filerefname = date.format(&completer.settings().dailynote).to_string();
-        let match_string = format!("{}: {}", Self::relative_date_string(date)?, filerefname);
+        let relative_name = Self::relative_date_string(date)?;
+        let match_string = format!("{}: {}", relative_name, filerefname);
 
         // path on unresolved file is useless
         Some(MDDailyNote {
             match_string,
             ref_name: filerefname.clone(),
+            relative_name,
             real_referenceaable: None,
         })
     }
